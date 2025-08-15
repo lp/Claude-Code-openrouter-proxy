@@ -1,0 +1,12 @@
+name = "anthropic-openrouter-proxy"
+main = "worker.js"                         # <= ton fichier
+compatibility_date = "2025-08-15"
+compatibility_flags = ["nodejs_compat"]    # pour fetch, crypto, etc.
+workers_dev = true
+
+[vars]
+REQUIRE_PROXY_TOKEN = "0"
+REASONING_EFFORT = "medium"
+
+[observability]
+enabled = true
