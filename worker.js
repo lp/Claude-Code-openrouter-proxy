@@ -42,7 +42,7 @@ export default {
     catch { return withCORS(json({ error: "invalid_json" }, 400)); }
 
     // ---------- Model mapping ----------
-    // NOTE: "$modeldemandé" => on laisse passer tel quel (pas de remap)
+    // "$modeldemandé" => on laisse passer tel quel (pas de remap)
     const MODEL_MAP_BASE = {
       "claude-3-5-haiku-20241022": "$modeldemandé",
       "claude-3-7-sonnet-latest":  "$modeldemandé",
@@ -55,7 +55,7 @@ export default {
     function mapModel(id) {
       if (FORCE_MODEL) return FORCE_MODEL;
       if (MODEL_MAP_EXT[id]) return MODEL_MAP_EXT[id];
-      if (MODEL_MAP_BASE[id] === "$modeldemandé") return id;      // <- passe tel quel
+      if (MODEL_MAP_BASE[id] === "$modeldemandé") return id;  // laisser passer tel quel
       if (MODEL_MAP_BASE[id]) return MODEL_MAP_BASE[id];
       return id;
     }
@@ -65,8 +65,8 @@ export default {
     const wantsStream = accept.includes("text/event-stream") || (body && body.stream === true);
     if (wantsStream) {
       const payload = toOpenRouterPayload(body, request, env, mapModel);
-      payload.stream = true;
-      payload.usage  = { include: true };
+      payload.stream = true;                 // stream OpenRouter
+      payload.usage  = { include: true };    // demander l'usage
 
       const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
       const orResp = await fetch(OPENROUTER_URL, {
@@ -342,8 +342,12 @@ function toOpenRouterPayload(b, request, env, mapModel) {
         if (assistantText.trim()) assistantMsg.content = assistantText.trim();
         if (tool_calls.length) assistantMsg.tool_calls = tool_calls;
         if (assistantMsg.content || assistantMsg.tool_calls) messagesOut.push(assistantMsg);
+
       } else if (role === "user") {
+        // *** PATCH: bufferiser d'abord les tool_result, puis émettre user, puis tools ***
         let userText = "";
+        const pendingToolMsgs = [];
+
         for (const block of content) {
           if (!block) continue;
           if (block.type === "text") {
@@ -353,12 +357,15 @@ function toOpenRouterPayload(b, request, env, mapModel) {
             const tool_call_id = block.tool_use_id || block.id || crypto.randomUUID();
             const output = block.output ?? block.content ?? "";
             const toolContent = typeof output === "string" ? output : JSON.stringify(output);
-            messagesOut.push({ role: "tool", tool_call_id, content: toolContent });
+            pendingToolMsgs.push({ role: "tool", tool_call_id, content: toolContent });
           } else {
             userText += JSON.stringify(block) + "\n";
           }
         }
+
         if (userText.trim()) messagesOut.push({ role: "user", content: userText.trim() });
+        for (const tm of pendingToolMsgs) messagesOut.push(tm);
+
       } else {
         messagesOut.push({ role, content: extractText(content) });
       }
@@ -529,8 +536,6 @@ function mapUsageFromOpenRouter(orUsage = {}) {
   // Champs OR fréquents:
   // prompt_tokens, completion_tokens
   // prompt_tokens_details.cached_tokens
-  // completion_tokens_details.reasoning_tokens
-  // cost (credits), cost_details.upstream_inference_cost
   const inTok  = Number(orUsage.prompt_tokens ?? orUsage.input_tokens ?? 0);
   const outTok = Number(orUsage.completion_tokens ?? orUsage.output_tokens ?? 0);
   const cached = Number(orUsage.prompt_tokens_details?.cached_tokens ?? 0);
