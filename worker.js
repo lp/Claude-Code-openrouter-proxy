@@ -10,8 +10,7 @@ export default {
     if (request.method === "POST" && url.pathname === "/v1/messages/count_tokens") {
       try {
         const body = await request.json();
-        const input_tokens = estimatePromptTokensFromAnthropic(body);
-        // Format minimal attendu par la CLI
+        const input_tokens = estimatePromptTokensFromAnthropic(body, env);
         return withCORS(json({ input_tokens }));
       } catch {
         return withCORS(json({ error: "invalid_json" }, 400));
@@ -24,13 +23,11 @@ export default {
     }
 
     // ---------- Auth ----------
-    // BYOK (client: header `anthropic-api-key` = sk-or-...) OU clé serveur (OPENROUTER_API_KEY)
     const clientKey = header(request, "anthropic-api-key") || header(request, "x-api-key") || "";
     const proxyToken = header(request, "proxy-token") || "";
     let orKey = "";
-
     if (clientKey && clientKey.startsWith("sk-or-")) {
-      orKey = clientKey;
+      orKey = clientKey; // BYOK
     } else {
       if (!env.OPENROUTER_API_KEY) return withCORS(json({ error: "missing_server_key" }, 401));
       if (String(env.REQUIRE_PROXY_TOKEN || "0") === "1" && proxyToken !== env.PROXY_TOKEN) {
@@ -60,10 +57,112 @@ export default {
       return id;
     }
 
-    // ---------- Build payload OpenRouter (bridge tools + usage.include) ----------
-    const payload = toOpenRouterPayload(body, request, env, mapModel);
+    // ---- STREAM BRANCH (SSE) ----
+    const accept = request.headers.get("accept") || "";
+    const wantsStream = accept.includes("text/event-stream") || (body && body.stream === true);
+    if (wantsStream) {
+      const payload = toOpenRouterPayload(body, request, env, mapModel);
+      payload.stream = true;                 // stream OpenRouter
+      payload.usage  = { include: true };    // demander l'usage
 
-    // ---------- Call OpenRouter (timeout + fallback) ----------
+      const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
+      const orResp = await fetch(OPENROUTER_URL, {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${orKey}`,
+          "Content-Type": "application/json",
+          "HTTP-Referer": "public-proxy",
+          "X-Title": "ClaudeCode via OpenRouter",
+        },
+        body: JSON.stringify(payload),
+      });
+
+      if (!orResp.ok || !orResp.body) {
+        const err = await orResp.text().catch(() => "");
+        return withCORS(new Response(err || "upstream_error", { status: orResp.status || 502 }));
+      }
+
+      const encoder = new TextEncoder();
+      const readable = new ReadableStream({
+        start(controller) {
+          const reader = orResp.body.getReader();
+          const sendEvent = (name, obj) => {
+            controller.enqueue(encoder.encode(`event: ${name}\n`));
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify(obj)}\n\n`));
+          };
+
+          // On peut envoyer un "message_start" minimal pour amorcer (optionnel)
+          sendEvent("message_start", { type: "message_start" });
+
+          (async () => {
+            const dec = new TextDecoder();
+            let buf = "";
+            let lastUsage = null;
+
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              buf += dec.decode(value, { stream: true });
+              const parts = buf.split("\n\n");
+              buf = parts.pop() || "";
+
+              for (const chunk of parts) {
+                const line = chunk.trim();
+                if (!line) continue;
+                const jsonLine = line.replace(/^data:\s*/i, "");
+                if (jsonLine === "[DONE]") continue;
+
+                let obj;
+                try { obj = JSON.parse(jsonLine); } catch { continue; }
+
+                // Texte incrémental
+                const delta = obj?.choices?.[0]?.delta?.content;
+                if (typeof delta === "string" && delta.length) {
+                  // Anthropic: content_block_delta avec text_delta
+                  sendEvent("content_block_delta", { type: "content_block_delta", delta: { type: "text_delta", text: delta } });
+                }
+
+                // Tool calls OpenAI-style -> ignorable dans le flux textuel court
+                // (Claude Code s'en sort déjà avec le non-stream pour tools)
+
+                // Usage final OR (présent sur le dernier chunk)
+                if (obj?.usage) {
+                  lastUsage = obj.usage;
+                }
+              }
+            }
+
+            // Injecte l'usage dans un message_delta final (ce que la CLI lit pour totaliser)
+            if (lastUsage) {
+              const u = mapUsageFromOpenRouter(lastUsage);
+              sendEvent("message_delta", { type: "message_delta", delta: { usage: u } });
+            }
+
+            // Terminaison Anthropic
+            sendEvent("message_stop", { type: "message_stop" });
+            controller.close();
+          })().catch((e) => controller.error(e));
+        }
+      });
+
+      return new Response(readable, {
+        status: 200,
+        headers: {
+          "content-type": "text/event-stream; charset=utf-8",
+          "cache-control": "no-cache, no-transform",
+          "connection": "keep-alive",
+          "transfer-encoding": "chunked",
+          // très important pour la CLI Anthropic
+          "anthropic-version": "2023-06-01",
+          "access-control-allow-origin": "*",
+          "access-control-allow-methods": "POST, GET, OPTIONS",
+          "access-control-allow-headers": "content-type, x-api-key, anthropic-api-key, anthropic-version, proxy-token, x-or-model"
+        }
+      });
+    }
+
+    // ---- NON-STREAM branch ----
+    const payload = toOpenRouterPayload(body, request, env, mapModel);
     const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
     const t0 = Date.now();
 
@@ -106,9 +205,9 @@ export default {
       return withCORS(json(data, resp.status));
     }
 
-    // Estimation input tokens (si besoin, pour fallback)
+    // Estimation input tokens (fallback éventuel)
     const inputTokensEstimate = shouldEstimateUsage(env)
-      ? estimatePromptTokensFromAnthropic(body)
+      ? estimatePromptTokensFromAnthropic(body, env)
       : 0;
 
     const { out, headers } = toAnthropicResponse(data, payload, durationMs, env, mapModel, inputTokensEstimate);
@@ -137,7 +236,7 @@ function shouldEstimateUsage(env) {
 
 function tokensPerChar(env) {
   const v = Number(env.ESTIMATE_TOKENS_PER_CHAR || 0.25);
-  return Number.isFinite(v) && v > 0 ? v : 0.25;
+  return Number.isFinite(v) && v > 0 ? v : 0.25; // ≈ 4 chars/token
 }
 
 function extractText(content) {
@@ -198,6 +297,12 @@ function estimatePromptTokensFromAnthropic(b, env) {
     }
   }
   return countTokensApprox(pieces.join("\n"));
+}
+
+function estimateOutputTokensFromText(text, env) {
+  const TOK_PER_CHAR = tokensPerChar(env || {});
+  const clamp = (n) => Math.max(0, Math.floor(n));
+  return clamp(String(text || "").length * TOK_PER_CHAR);
 }
 
 /* --------- Build OR payload (messages + tools + usage.include) --------- */
@@ -316,10 +421,8 @@ function toAnthropicResponse(orjson, payload, durationMs, env, mapModel, inputTo
 
   const hasTools = toolUseBlocks.length > 0;
 
-  // Usage OpenRouter -> Anthropic
+  // Usage OR -> Anthropic
   let usageAnthropic = mapUsageFromOpenRouter(orjson.usage || {});
-
-  // Fallback estimation si usage manquant et flag activé
   if (shouldEstimateUsage(env) && usageAnthropic.input_tokens === 0 && usageAnthropic.output_tokens === 0) {
     const outTokEst = estimateOutputTokensFromText(text, env);
     const inTokEst  = inputTokensEstimate != null ? inputTokensEstimate : 0;
@@ -388,39 +491,6 @@ function toAnthropicResponse(orjson, payload, durationMs, env, mapModel, inputTo
   return { out, headers: extraHeaders };
 }
 
-function estimateOutputTokensFromText(text, env) {
-  const TOK_PER_CHAR = tokensPerChar(env || {});
-  const clamp = (n) => Math.max(0, Math.floor(n));
-  return clamp(String(text || "").length * TOK_PER_CHAR);
-}
-
-function mapUsageFromOpenRouter(orUsage = {}) {
-  // Champs OR fréquents:
-  // prompt_tokens, completion_tokens
-  // prompt_tokens_details.cached_tokens
-  // completion_tokens_details.reasoning_tokens
-  // cost (credits), cost_details.upstream_inference_cost
-  const inTok  = Number(orUsage.prompt_tokens ?? orUsage.input_tokens ?? 0);
-  const outTok = Number(orUsage.completion_tokens ?? orUsage.output_tokens ?? 0);
-  const cached = Number(orUsage.prompt_tokens_details?.cached_tokens ?? 0);
-  return {
-    input_tokens: inTok,
-    output_tokens: outTok,
-    cache_creation_input_tokens: 0, // OR ne fournit pas "cache write"
-    cache_read_input_tokens: cached,
-  };
-}
-
-function computeCostUSD(usageAnthropic, model, pricing) {
-  const p = pricing?.[model];
-  if (!p) return null;
-  const inTok  = usageAnthropic.input_tokens  || 0;
-  const outTok = usageAnthropic.output_tokens || 0;
-  const inCost  = (inTok  / 1000) * (p.in  || 0);
-  const outCost = (outTok / 1000) * (p.out || 0);
-  return { total: inCost + outCost, inCost, outCost };
-}
-
 /* ========================= HTTP Utils ========================= */
 
 function json(obj, status = 200, extraHeaders = {}) {
@@ -451,4 +521,33 @@ async function timedFetch(url, options, env) {
     clearTimeout(t);
     throw e;
   }
+}
+
+/* ========================= Usage/Cost mapping ========================= */
+
+function mapUsageFromOpenRouter(orUsage = {}) {
+  // Champs OR fréquents:
+  // prompt_tokens, completion_tokens
+  // prompt_tokens_details.cached_tokens
+  // completion_tokens_details.reasoning_tokens
+  // cost (credits), cost_details.upstream_inference_cost
+  const inTok  = Number(orUsage.prompt_tokens ?? orUsage.input_tokens ?? 0);
+  const outTok = Number(orUsage.completion_tokens ?? orUsage.output_tokens ?? 0);
+  const cached = Number(orUsage.prompt_tokens_details?.cached_tokens ?? 0);
+  return {
+    input_tokens: inTok,
+    output_tokens: outTok,
+    cache_creation_input_tokens: 0, // OR ne fournit pas "cache write"
+    cache_read_input_tokens: cached,
+  };
+}
+
+function computeCostUSD(usageAnthropic, model, pricing) {
+  const p = pricing?.[model];
+  if (!p) return null;
+  const inTok  = usageAnthropic.input_tokens  || 0;
+  const outTok = usageAnthropic.output_tokens || 0;
+  const inCost  = (inTok  / 1000) * (p.in  || 0);
+  const outCost = (outTok / 1000) * (p.out || 0);
+  return { total: inCost + outCost, inCost, outCost };
 }
