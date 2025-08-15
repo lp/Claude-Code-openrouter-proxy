@@ -42,17 +42,20 @@ export default {
     catch { return withCORS(json({ error: "invalid_json" }, 400)); }
 
     // ---------- Model mapping ----------
+    // NOTE: "$modeldemandé" => on laisse passer tel quel (pas de remap)
     const MODEL_MAP_BASE = {
-      "claude-3-5-haiku-20241022": "anthropic/claude-3.5-haiku",
-      "claude-3-7-sonnet-latest":  "anthropic/claude-3.7-sonnet",
-      "claude-3-7-sonnet-20250219":"anthropic/claude-3.7-sonnet",
-      "claude-3-opus-20240229":    "anthropic/claude-3-opus",
+      "claude-3-5-haiku-20241022": "$modeldemandé",
+      "claude-3-7-sonnet-latest":  "$modeldemandé",
+      "claude-3-7-sonnet-20250219":"$modeldemandé",
+      "claude-3-opus-20240229":    "$modeldemandé",
     };
     const MODEL_MAP_EXT = parseJSON(env.MODEL_MAP_EXT, {});
     const FORCE_MODEL   = (env.FORCE_MODEL || "").trim();
+
     function mapModel(id) {
       if (FORCE_MODEL) return FORCE_MODEL;
       if (MODEL_MAP_EXT[id]) return MODEL_MAP_EXT[id];
+      if (MODEL_MAP_BASE[id] === "$modeldemandé") return id;      // <- passe tel quel
       if (MODEL_MAP_BASE[id]) return MODEL_MAP_BASE[id];
       return id;
     }
@@ -62,8 +65,8 @@ export default {
     const wantsStream = accept.includes("text/event-stream") || (body && body.stream === true);
     if (wantsStream) {
       const payload = toOpenRouterPayload(body, request, env, mapModel);
-      payload.stream = true;                 // stream OpenRouter
-      payload.usage  = { include: true };    // demander l'usage
+      payload.stream = true;
+      payload.usage  = { include: true };
 
       const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
       const orResp = await fetch(OPENROUTER_URL, {
@@ -91,7 +94,7 @@ export default {
             controller.enqueue(encoder.encode(`data: ${JSON.stringify(obj)}\n\n`));
           };
 
-          // On peut envoyer un "message_start" minimal pour amorcer (optionnel)
+          // (optionnel) amorce compatible Anthropic
           sendEvent("message_start", { type: "message_start" });
 
           (async () => {
@@ -118,27 +121,26 @@ export default {
                 // Texte incrémental
                 const delta = obj?.choices?.[0]?.delta?.content;
                 if (typeof delta === "string" && delta.length) {
-                  // Anthropic: content_block_delta avec text_delta
-                  sendEvent("content_block_delta", { type: "content_block_delta", delta: { type: "text_delta", text: delta } });
+                  sendEvent("content_block_delta", {
+                    type: "content_block_delta",
+                    delta: { type: "text_delta", text: delta }
+                  });
                 }
 
-                // Tool calls OpenAI-style -> ignorable dans le flux textuel court
-                // (Claude Code s'en sort déjà avec le non-stream pour tools)
-
-                // Usage final OR (présent sur le dernier chunk)
+                // Usage final OR (souvent dans le dernier chunk)
                 if (obj?.usage) {
                   lastUsage = obj.usage;
                 }
               }
             }
 
-            // Injecte l'usage dans un message_delta final (ce que la CLI lit pour totaliser)
+            // Injecte usage dans message_delta final (ce que la CLI lit)
             if (lastUsage) {
               const u = mapUsageFromOpenRouter(lastUsage);
               sendEvent("message_delta", { type: "message_delta", delta: { usage: u } });
             }
 
-            // Terminaison Anthropic
+            // Fin
             sendEvent("message_stop", { type: "message_stop" });
             controller.close();
           })().catch((e) => controller.error(e));
@@ -152,7 +154,6 @@ export default {
           "cache-control": "no-cache, no-transform",
           "connection": "keep-alive",
           "transfer-encoding": "chunked",
-          // très important pour la CLI Anthropic
           "anthropic-version": "2023-06-01",
           "access-control-allow-origin": "*",
           "access-control-allow-methods": "POST, GET, OPTIONS",
@@ -205,7 +206,6 @@ export default {
       return withCORS(json(data, resp.status));
     }
 
-    // Estimation input tokens (fallback éventuel)
     const inputTokensEstimate = shouldEstimateUsage(env)
       ? estimatePromptTokensFromAnthropic(body, env)
       : 0;
