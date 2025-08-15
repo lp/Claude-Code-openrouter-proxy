@@ -344,10 +344,9 @@ function toOpenRouterPayload(b, request, env, mapModel) {
         if (assistantMsg.content || assistantMsg.tool_calls) messagesOut.push(assistantMsg);
 
       } else if (role === "user") {
-        // Bufferiser le texte et les tool_result
+        // 1) Buffer: texte + tool_result
         let userText = "";
         const pendingToolMsgs = [];
-      
         for (const block of content) {
           if (!block) continue;
           if (block.type === "text") {
@@ -362,8 +361,8 @@ function toOpenRouterPayload(b, request, env, mapModel) {
             userText += JSON.stringify(block) + "\n";
           }
         }
-      
-        // Trouver l'assistant précédent qui a des tool_calls
+
+        // 2) Trouver le dernier assistant avec tool_calls
         let prevAssistantIdx = -1;
         for (let i = messagesOut.length - 1; i >= 0; i--) {
           const mprev = messagesOut[i];
@@ -371,19 +370,17 @@ function toOpenRouterPayload(b, request, env, mapModel) {
             prevAssistantIdx = i;
             break;
           } else if (mprev.role !== "tool" && mprev.role !== "assistant") {
-            // on a croisé un autre type → plus de fenêtre valide
             break;
           }
         }
-      
+
+        // 3) Si on a des tool_result ET un assistant à satisfaire → INSERT tools juste après l’assistant
         if (pendingToolMsgs.length && prevAssistantIdx >= 0) {
           const prevAssistant = messagesOut[prevAssistantIdx];
           const toolIds = (prevAssistant.tool_calls || []).map(tc => tc.id).filter(Boolean);
-          const idToName = new Map(
-            (prevAssistant.tool_calls || []).map(tc => [tc.id, tc.function?.name || "tool"])
-          );
-      
-          // Séparer valides/invalides + ordonner les valides comme l'assistant
+          const idToName = new Map((prevAssistant.tool_calls || []).map(tc => [tc.id, tc.function?.name || "tool"]));
+
+          // ordonner et nommer
           const validById = new Map();
           const invalidTools = [];
           for (const tm of pendingToolMsgs) {
@@ -398,29 +395,57 @@ function toOpenRouterPayload(b, request, env, mapModel) {
               invalidTools.push(tm);
             }
           }
-          const orderedValidTools = toolIds
-            .filter(id => validById.has(id))
-            .map(id => validById.get(id));
-      
-          // INSÉRER les tools IMMÉDIATEMENT APRES l'assistant (≠ push)
+          const orderedValidTools = toolIds.filter(id => validById.has(id)).map(id => validById.get(id));
+
+          // INSÉRER IMMÉDIATEMENT APRÈS l’assistant
           if (orderedValidTools.length) {
             messagesOut.splice(prevAssistantIdx + 1, 0, ...orderedValidTools);
           }
-      
-          // Replier les invalides dans le texte du user
+
+          // 4) Replie les invalides dans le texte du user
           if (invalidTools.length) {
-            const folded =
-              "\n\n[tool_result]\n" +
-              invalidTools.map(t => `id=${t.tool_call_id} content=${t.content}`).join("\n");
+            const folded = "\n\n[tool_result]\n" + invalidTools.map(t => `id=${t.tool_call_id} content=${t.content}`).join("\n");
             userText += folded;
           }
+
+          // 5) CRUCIAL: si on a inséré des tools, on N’ÉMET PAS de nouveau message user dans ce tour
+          continue; // saute l'émission de user
         }
-      
-        // N'émettre le user que s'il reste du texte utile
+
+        // 6) Sinon (pas de tool_result reliés), on peut pousser un user normal si du texte existe
         const trimmed = (userText || "").trim();
         if (trimmed) {
           messagesOut.push({ role: "user", content: trimmed });
         }
+      }
+    }
+  }
+
+  // ---- Post-normalization Mistral-safe ----
+  // Retire tout user coincé entre un assistant(tool_calls) et ses tool
+  for (let i = 0; i < messagesOut.length; i++) {
+    const m = messagesOut[i];
+    if (m.role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
+      const toolIds = new Set(m.tool_calls.map(tc => tc.id).filter(Boolean));
+      let j = i + 1;
+      const usersToRemove = [];
+      let seenTools = 0;
+      while (j < messagesOut.length) {
+        const mj = messagesOut[j];
+        if (mj.role === "tool" && toolIds.has(mj.tool_call_id)) {
+          seenTools++;
+          j++;
+          continue;
+        }
+        if (mj.role === "user" && seenTools === 0) {
+          usersToRemove.push(j);
+          j++;
+          continue;
+        }
+        break;
+      }
+      for (let k = usersToRemove.length - 1; k >= 0; k--) {
+        messagesOut.splice(usersToRemove[k], 1);
       }
     }
   }
@@ -550,18 +575,6 @@ function toAnthropicResponse(orjson, payload, durationMs, env, mapModel, inputTo
     content: blocks.length ? blocks : [{ type: "text", text: "" }],
     stop_reason: hasTools ? "tool_use" : "end_turn",
     usage: usageAnthropic,
-    proxy_meta: {
-      model: stableModel,
-      openrouter_usage: orjson.usage || null,
-      usage: {
-        prompt_tokens: usageAnthropic.input_tokens,
-        completion_tokens: usageAnthropic.output_tokens,
-        total_tokens: totalTokens,
-      },
-      duration_ms: durationMs,
-      tps: tps != null ? Number(tps.toFixed(2)) : null,
-      cost_usd: costUSD ? Number(costUSD.total.toFixed(6)) : null,
-    },
   };
 
   return { out, headers: extraHeaders };
