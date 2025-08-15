@@ -2,19 +2,16 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    if (url.pathname === "/health") {
-      return withCORS(json({ ok: true }));
-    }
-    if (request.method === "OPTIONS") {
-      return withCORS(new Response(null, { status: 204 }));
-    }
+    // Health & CORS preflight
+    if (url.pathname === "/health") return withCORS(json({ ok: true }));
+    if (request.method === "OPTIONS") return withCORS(new Response(null, { status: 204 }));
+
     if (request.method !== "POST" || url.pathname !== "/v1/messages") {
       return withCORS(json({ error: "not_found" }, 404));
     }
 
     // ---------- Auth ----------
-    // BYOK (client fournit sa clé OpenRouter dans ANTHROPIC_API_KEY / X-API-Key)
-    // ou clé serveur (OPENROUTER_API_KEY) protégée avec PROXY_TOKEN si REQUIRE_PROXY_TOKEN=1
+    // BYOK (client: header `anthropic-api-key` = sk-or-...) OU clé serveur (OPENROUTER_API_KEY)
     const clientKey = header(request, "anthropic-api-key") || header(request, "x-api-key") || "";
     const proxyToken = header(request, "proxy-token") || "";
     let orKey = "";
@@ -22,32 +19,25 @@ export default {
     if (clientKey && clientKey.startsWith("sk-or-")) {
       orKey = clientKey;
     } else {
-      if (!env.OPENROUTER_API_KEY) {
-        return withCORS(json({ error: "missing_server_key" }, 401));
-      }
+      if (!env.OPENROUTER_API_KEY) return withCORS(json({ error: "missing_server_key" }, 401));
       if (String(env.REQUIRE_PROXY_TOKEN || "0") === "1" && proxyToken !== env.PROXY_TOKEN) {
         return withCORS(json({ error: "forbidden" }, 403));
       }
       orKey = env.OPENROUTER_API_KEY;
     }
 
-    // ---------- Lecture du body ----------
+    // ---------- Body ----------
     let body;
-    try {
-      body = await request.json();
-    } catch {
-      return withCORS(json({ error: "invalid_json" }, 400));
-    }
+    try { body = await request.json(); }
+    catch { return withCORS(json({ error: "invalid_json" }, 400)); }
 
-    // ---------- Mapping modèles ----------
+    // ---------- Model mapping ----------
     const MODEL_MAP_BASE = {
       "claude-3-5-haiku-20241022": "anthropic/claude-3.5-haiku",
       "claude-3-7-sonnet-latest":  "anthropic/claude-3.7-sonnet",
       "claude-3-7-sonnet-20250219":"anthropic/claude-3.7-sonnet",
       "claude-3-opus-20240229":    "anthropic/claude-3-opus",
     };
-
-    // Extension/override via env JSON
     const MODEL_MAP_EXT = parseJSON(env.MODEL_MAP_EXT, {});
     const FORCE_MODEL   = (env.FORCE_MODEL || "").trim();
     function mapModel(id) {
@@ -57,7 +47,7 @@ export default {
       return id;
     }
 
-    // ---------- Helpers payload ----------
+    // ---------- Helpers ----------
     function extractText(content) {
       if (Array.isArray(content)) {
         return content.map((b) => {
@@ -82,8 +72,6 @@ export default {
     }
 
     function mapToolsAnthropicToOpenAI(tools = []) {
-      // Anthropic: [{name, description, input_schema}]
-      // OpenAI:    [{type:"function", function:{name, description, parameters}}]
       return (tools || []).map((t) => ({
         type: "function",
         function: {
@@ -94,15 +82,40 @@ export default {
       }));
     }
 
-    // ---------- Build payload OpenRouter (bridge tools) ----------
+    // ----- Estimation tokens fallback (si usage absent) -----
+    const ESTIMATE_USAGE = String(env.ESTIMATE_USAGE || "1") === "1";
+    const TOK_PER_CHAR = Number(env.ESTIMATE_TOKENS_PER_CHAR || 0.25); // ≈ 4 chars/token
+    const clamp = (n) => Math.max(0, Math.floor(n));
+    const countTokensApprox = (text) => clamp((text || "").length * TOK_PER_CHAR);
+
+    function estimatePromptTokensFromAnthropic(b) {
+      // Texte d’entrée (system + messages texte + tool_result)
+      let pieces = [];
+      if (b.system) pieces.push(extractText(b.system));
+      for (const m of (b.messages || [])) {
+        const role = m.role || "user";
+        const c = m.content;
+        if (Array.isArray(c)) {
+          for (const blok of c) {
+            if (blok?.type === "text") pieces.push(typeof blok.text === "string" ? blok.text : JSON.stringify(blok.text));
+            if (role === "user" && blok?.type === "tool_result") {
+              const out = blok.output ?? blok.content ?? "";
+              pieces.push(typeof out === "string" ? out : JSON.stringify(out));
+            }
+          }
+        } else {
+          pieces.push(extractText(c));
+        }
+      }
+      return countTokensApprox(pieces.join("\n"));
+    }
+
+    // ---------- Build payload OpenRouter (bridge tools + usage.include) ----------
     function toOpenRouterPayload(b) {
       const messagesOut = [];
       const toolsOA = mapToolsAnthropicToOpenAI(b.tools || []);
 
-      // system
-      if (b.system) {
-        messagesOut.push({ role: "system", content: extractText(b.system) });
-      }
+      if (b.system) messagesOut.push({ role: "system", content: extractText(b.system) });
 
       for (const m of (b.messages || [])) {
         const role = m.role || "user";
@@ -112,7 +125,6 @@ export default {
           if (role === "assistant") {
             let assistantText = "";
             const tool_calls = [];
-
             for (const block of content) {
               if (!block) continue;
               if (block.type === "text") {
@@ -131,7 +143,6 @@ export default {
                 assistantText += JSON.stringify(block) + "\n";
               }
             }
-
             const assistantMsg = { role: "assistant" };
             if (assistantText.trim()) assistantMsg.content = assistantText.trim();
             if (tool_calls.length) assistantMsg.tool_calls = tool_calls;
@@ -169,27 +180,26 @@ export default {
         messages: messagesOut,
         temperature: b.temperature ?? 0.2,
         max_tokens: b.max_tokens ?? 1024,
+        usage: { include: true }, // <-- important pour OpenRouter usage accounting
       };
       if (toolsOA.length) out.tools = toolsOA;
 
-      // Reasoning basique si :thinking
       if ((reqModel || "").includes(":thinking")) {
         out.reasoning = { effort: env.REASONING_EFFORT || "medium" };
       }
 
-      // Override ponctuel par header (pour tests)
+      // Overrides
       const overrideModel = header(request, "x-or-model") || "";
       if (overrideModel) out.model = overrideModel.trim();
 
-      // Force/fallback via env
       const PRIMARY_MODEL  = (env.PRIMARY_MODEL  || "").trim();
       if (PRIMARY_MODEL) out.model = PRIMARY_MODEL;
 
       return out;
     }
 
-    // ---------- OpenRouter -> Anthropic (bridge tools + usage) ----------
-    function toAnthropicResponse(orjson, payload, durationMs, env) {
+    // ---------- Mapping OpenRouter -> Anthropic (tools + usage) ----------
+    function toAnthropicResponse(orjson, payload, durationMs, env, inputTokensEstimate) {
       const choice = (orjson.choices && orjson.choices[0]) || {};
       const msg = choice.message || {};
       const content = msg.content ?? "";
@@ -216,18 +226,35 @@ export default {
 
       const hasTools = toolUseBlocks.length > 0;
 
-      // Usage -> format Anthropic
-      const usageAnthropic = mapUsageForAnthropic(orjson.usage || {});
+      // ---- Usage OpenRouter -> Anthropic ----
+      // OpenRouter renvoie: usage.prompt_tokens, usage.completion_tokens, usage.prompt_tokens_details.cached_tokens, usage.cost, ...
+      let usageAnthropic = mapUsageFromOpenRouter(orjson.usage || {});
+
+      // Fallback estimation si usage manquant et flag activé
+      if (
+        ESTIMATE_USAGE &&
+        usageAnthropic.input_tokens === 0 &&
+        usageAnthropic.output_tokens === 0
+      ) {
+        const outTokEst = countTokensApprox(text || "");
+        const inTokEst  = inputTokensEstimate != null ? inputTokensEstimate : 0;
+        usageAnthropic = {
+          input_tokens: inTokEst,
+          output_tokens: outTokEst,
+          cache_creation_input_tokens: 0,
+          cache_read_input_tokens: 0,
+        };
+      }
+
       const modelUsedRaw = orjson.model || payload.model || "openrouter";
       const stableModel  = mapModel(modelUsedRaw);
 
-      // Pricing / headers meta
+      // Pricing (USD estimé) + meta headers
       const pricing = parseJSON(env.PRICING_JSON, {});
-      const cost    = computeCostUSD(usageAnthropic, stableModel, pricing);
+      const costUSD = computeCostUSD(usageAnthropic, stableModel, pricing);
       const totalTokens = usageAnthropic.input_tokens + usageAnthropic.output_tokens;
       const tps = totalTokens > 0 ? totalTokens / (durationMs / 1000) : null;
 
-      // Headers additionnels
       const extraHeaders = {
         "X-OR-Model": stableModel,
         "X-OR-Prompt-Tokens": String(usageAnthropic.input_tokens),
@@ -236,12 +263,18 @@ export default {
         "X-OR-Duration-MS": String(durationMs),
       };
       if (tps != null) extraHeaders["X-OR-TPS"] = String(tps.toFixed(1));
-      if (cost) extraHeaders["X-OR-Cost-USD"] = String(cost.total.toFixed(6));
+      if (typeof orjson.usage?.cost === "number") {
+        extraHeaders["X-OR-Cost-Credits"] = String(orjson.usage.cost);
+      }
+      if (typeof orjson.usage?.cost_details?.upstream_inference_cost === "number") {
+        extraHeaders["X-OR-Upstream-Cost"] = String(orjson.usage.cost_details.upstream_inference_cost);
+      }
+      if (costUSD) extraHeaders["X-OR-Cost-USD"] = String(costUSD.total.toFixed(6));
 
-      // Log sympa
       console.log(
         `[USAGE] model=${stableModel} in=${usageAnthropic.input_tokens} out=${usageAnthropic.output_tokens}` +
-        (cost ? ` cost~$${cost.total.toFixed(6)}` : ``) +
+        (typeof orjson.usage?.cost === "number" ? ` cost_credits=${orjson.usage.cost}` : ``) +
+        (costUSD ? ` cost_usd~$${costUSD.total.toFixed(6)}` : ``) +
         (tps ? ` tps=${tps.toFixed(1)}` : ``) + ` dur=${durationMs}ms`
       );
 
@@ -253,8 +286,10 @@ export default {
         content: blocks.length ? blocks : [{ type: "text", text: "" }],
         stop_reason: hasTools ? "tool_use" : "end_turn",
         usage: usageAnthropic,
+        // meta non standard (diagnostic)
         proxy_meta: {
           model: stableModel,
+          openrouter_usage: orjson.usage || null,
           usage: {
             prompt_tokens: usageAnthropic.input_tokens,
             completion_tokens: usageAnthropic.output_tokens,
@@ -262,14 +297,14 @@ export default {
           },
           duration_ms: durationMs,
           tps: tps != null ? Number(tps.toFixed(2)) : null,
-          cost_usd: cost ? Number(cost.total.toFixed(6)) : null,
+          cost_usd: costUSD ? Number(costUSD.total.toFixed(6)) : null,
         },
       };
 
       return { out, headers: extraHeaders };
     }
 
-    // ---------- Appel OpenRouter avec timeout + fallback optionnel ----------
+    // ---------- Call OpenRouter (timeout + fallback) ----------
     const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
     const t0 = Date.now();
     const payload = toOpenRouterPayload(body);
@@ -285,7 +320,7 @@ export default {
       body: JSON.stringify(payload),
     }, env);
 
-    // Fallback si 429/5xx et FALLBACK_MODEL défini
+    // Fallback si 429/5xx
     if (!resp.ok) {
       const status = resp.status;
       const FALLBACK_MODEL = (env.FALLBACK_MODEL || "").trim();
@@ -313,7 +348,10 @@ export default {
       return withCORS(json(data, resp.status));
     }
 
-    const { out, headers } = toAnthropicResponse(data, payload, durationMs, env);
+    // Estimation input tokens (si besoin)
+    const inputTokensEstimate = ESTIMATE_USAGE ? estimatePromptTokensFromAnthropic(body) : 0;
+
+    const { out, headers } = toAnthropicResponse(data, payload, durationMs, env, inputTokensEstimate);
     return withCORS(json(out, 200, headers));
   }
 };
@@ -332,18 +370,20 @@ function parseJSON(raw, fallback) {
   }
 }
 
-function mapUsageForAnthropic(orUsage = {}) {
-  // OpenRouter peut renvoyer prompt_tokens/completion_tokens OU input_tokens/output_tokens
+function mapUsageFromOpenRouter(orUsage = {}) {
+  // Champs OR usuels:
+  // prompt_tokens, completion_tokens
+  // prompt_tokens_details.cached_tokens
+  // completion_tokens_details.reasoning_tokens
+  // cost (credits), cost_details.upstream_inference_cost
   const inTok  = Number(orUsage.prompt_tokens ?? orUsage.input_tokens ?? 0);
   const outTok = Number(orUsage.completion_tokens ?? orUsage.output_tokens ?? 0);
-  const cacheCreate = Number(orUsage.cache_creation_input_tokens ?? 0);
-  const cacheRead   = Number(orUsage.cache_read_input_tokens ?? 0);
-
+  const cached = Number(orUsage.prompt_tokens_details?.cached_tokens ?? 0);
   return {
     input_tokens: inTok,
     output_tokens: outTok,
-    cache_creation_input_tokens: cacheCreate,
-    cache_read_input_tokens: cacheRead,
+    cache_creation_input_tokens: 0, // OR ne fournit pas "cache write"
+    cache_read_input_tokens: cached,
   };
 }
 
@@ -360,10 +400,7 @@ function computeCostUSD(usageAnthropic, model, pricing) {
 function json(obj, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(obj), {
     status,
-    headers: {
-      "content-type": "application/json",
-      ...extraHeaders,
-    },
+    headers: { "content-type": "application/json", ...extraHeaders },
   });
 }
 
