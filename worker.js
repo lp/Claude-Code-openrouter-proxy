@@ -344,8 +344,7 @@ function toOpenRouterPayload(b, request, env, mapModel) {
         if (assistantMsg.content || assistantMsg.tool_calls) messagesOut.push(assistantMsg);
 
       } else if (role === "user") {
-        // ✅ PATCH Mistral/OpenAI: ne jamais émettre `tool` juste après `user`.
-        // On bufferise d'abord les tool_result, puis on décide comment les émettre.
+        // Bufferiser les tool_result puis décider comment les émettre
         let userText = "";
         const pendingToolMsgs = [];
       
@@ -364,49 +363,46 @@ function toOpenRouterPayload(b, request, env, mapModel) {
           }
         }
       
-        // 1) on pousse le message user (s'il a du texte)
-        let pushedUser = false;
-        if (userText.trim()) {
-          messagesOut.push({ role: "user", content: userText.trim() });
-          pushedUser = true;
-        } else if (!pendingToolMsgs.length) {
-          // rien à pousser
-          continue;
-        }
+        // 1) Pousser le user (même vide, si on doit y replier des tool_result)
+        const userIndex = messagesOut.push({ role: "user", content: (userText || "").trim() }) - 1;
       
-        // 2) Peut-on légalement émettre des messages `tool` maintenant ?
-        //    -> Seulement si le message précédent est un assistant AVEC tool_calls.
-        const prev = messagesOut[messagesOut.length - 1 - (pushedUser ? 1 : 0)] // avant le user qu’on vient d’ajouter
-                 || messagesOut[messagesOut.length - 1];                          // ou le tout dernier si pas de user
-      
-        const prevIsAssistantWithCalls =
-          prev && prev.role === "assistant" && Array.isArray(prev.tool_calls) && prev.tool_calls.length > 0;
-      
-        if (pendingToolMsgs.length) {
-          if (prevIsAssistantWithCalls) {
-            // ✅ Ordre valide: assistant(tool_calls) -> tool
-            for (const tm of pendingToolMsgs) messagesOut.push(tm);
-          } else {
-            // ❌ On ne peut PAS envoyer `tool` ici. On replie les sorties d'outils dans le user précédent.
-            //    Ça garde la requête valide sur Mistral/OpenAI.
-            const foldText =
-              "\n\n[tool_result]\n" +
-              pendingToolMsgs.map(t => t.content).join("\n");
-            // si on a poussé un user juste avant, on l’enrichit; sinon on crée un user synthétique
-            if (pushedUser) {
-              const last = messagesOut[messagesOut.length - 1];
-              last.content = (last.content ? String(last.content) : "") + foldText;
-            } else {
-              // aucun user text, on crée un user pour porter les tool_result comme texte brut
-              messagesOut.push({ role: "user", content: foldText.trim() });
-            }
+        // 2) Chercher le DERNIER assistant avec tool_calls juste AVANT ce user
+        let prevAssistantWithCalls = null;
+        for (let i = messagesOut.length - 2; i >= 0; i--) {
+          const mprev = messagesOut[i];
+          if (mprev.role === "assistant" && Array.isArray(mprev.tool_calls) && mprev.tool_calls.length > 0) {
+            prevAssistantWithCalls = mprev;
+            break;
+          } else if (mprev.role !== "tool" && mprev.role !== "assistant") {
+            // On a croisé autre chose qu'un tool/assistant → plus de fenêtre valide
+            break;
           }
         }
-    } else {
-      messagesOut.push({ role, content: extractText(content) });
+      
+        if (pendingToolMsgs.length) {
+          const allIds = new Set((prevAssistantWithCalls?.tool_calls || []).map(tc => tc.id).filter(Boolean));
+          const validTools = [];
+          const invalidTools = [];
+      
+          for (const tm of pendingToolMsgs) {
+            if (allIds.has(tm.tool_call_id)) validTools.push(tm);
+            else invalidTools.push(tm);
+          }
+      
+          // 3) Émettre UNIQUEMENT les tool avec id correspondant
+          for (const tm of validTools) messagesOut.push(tm);
+      
+          // 4) Replier les tool invalides dans le texte du user (pas d'envoi de `role:"tool"`)
+          if (invalidTools.length) {
+            const folded =
+              "\n\n[tool_result]\n" +
+              invalidTools.map(t => `id=${t.tool_call_id} content=${t.content}`).join("\n");
+            messagesOut[userIndex].content = (messagesOut[userIndex].content || "") + folded;
+          }
+        }
+      }
     }
   }
-}  
 
   const reqModel    = b.model || "anthropic/claude-3.7-sonnet";
   const mappedModel = mapModel(reqModel);
