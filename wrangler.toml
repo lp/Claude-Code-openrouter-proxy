@@ -1,4 +1,4 @@
-name = "anthropic-openrouter-proxy"
+name = "proxycodeclaude"
 main = "worker.js"                         # <= ton fichier
 compatibility_date = "2025-08-15"
 compatibility_flags = ["nodejs_compat"]    # pour fetch, crypto, etc.
