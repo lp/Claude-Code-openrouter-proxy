@@ -180,7 +180,7 @@ export default {
         messages: messagesOut,
         temperature: b.temperature ?? 0.2,
         max_tokens: b.max_tokens ?? 1024,
-        usage: { include: true }, // <-- important pour OpenRouter usage accounting
+        usage: { include: true }, // <-- usage accounting OpenRouter
       };
       if (toolsOA.length) out.tools = toolsOA;
 
@@ -227,7 +227,6 @@ export default {
       const hasTools = toolUseBlocks.length > 0;
 
       // ---- Usage OpenRouter -> Anthropic ----
-      // OpenRouter renvoie: usage.prompt_tokens, usage.completion_tokens, usage.prompt_tokens_details.cached_tokens, usage.cost, ...
       let usageAnthropic = mapUsageFromOpenRouter(orjson.usage || {});
 
       // Fallback estimation si usage manquant et flag activé
@@ -247,7 +246,7 @@ export default {
       }
 
       const modelUsedRaw = orjson.model || payload.model || "openrouter";
-      const stableModel  = mapModel(modelUsedRaw);
+      const stableModel  = mapModel(modelUsedRaw); // <- modèle stable renvoyé
 
       // Pricing (USD estimé) + meta headers
       const pricing = parseJSON(env.PRICING_JSON, {});
@@ -371,7 +370,7 @@ function parseJSON(raw, fallback) {
 }
 
 function mapUsageFromOpenRouter(orUsage = {}) {
-  // Champs OR usuels:
+  // Champs OR fréquents:
   // prompt_tokens, completion_tokens
   // prompt_tokens_details.cached_tokens
   // completion_tokens_details.reasoning_tokens
@@ -409,6 +408,7 @@ function withCORS(resp) {
   h.set("access-control-allow-origin", "*");
   h.set("access-control-allow-methods", "POST, GET, OPTIONS");
   h.set("access-control-allow-headers", "content-type, x-api-key, anthropic-api-key, anthropic-version, proxy-token, x-or-model");
+  h.set("anthropic-version", "2023-06-01"); // PATCH: header version Anthropic pour compat Claude Code
   return new Response(resp.body, { status: resp.status, headers: h });
 }
 
