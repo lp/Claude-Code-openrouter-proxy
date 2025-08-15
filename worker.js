@@ -344,10 +344,10 @@ function toOpenRouterPayload(b, request, env, mapModel) {
         if (assistantMsg.content || assistantMsg.tool_calls) messagesOut.push(assistantMsg);
 
       } else if (role === "user") {
-        // Bufferiser les tool_result puis décider comment les émettre
+        // Bufferiser le texte et les tool_result
         let userText = "";
         const pendingToolMsgs = [];
-
+      
         for (const block of content) {
           if (!block) continue;
           if (block.type === "text") {
@@ -362,48 +362,52 @@ function toOpenRouterPayload(b, request, env, mapModel) {
             userText += JSON.stringify(block) + "\n";
           }
         }
-
-        // Chercher le DERNIER assistant avec tool_calls juste AVANT ce user
-        let prevAssistantWithCalls = null;
+      
+        // Trouver l'assistant précédent qui a des tool_calls
+        let prevAssistantIdx = -1;
         for (let i = messagesOut.length - 1; i >= 0; i--) {
           const mprev = messagesOut[i];
           if (mprev.role === "assistant" && Array.isArray(mprev.tool_calls) && mprev.tool_calls.length > 0) {
-            prevAssistantWithCalls = mprev;
+            prevAssistantIdx = i;
             break;
           } else if (mprev.role !== "tool" && mprev.role !== "assistant") {
-            // On a croisé autre chose qu'un tool/assistant → plus de fenêtre valide
+            // on a croisé un autre type → plus de fenêtre valide
             break;
           }
         }
-
-        if (pendingToolMsgs.length && prevAssistantWithCalls) {
-          const allIds = new Set((prevAssistantWithCalls.tool_calls || []).map(tc => tc.id).filter(Boolean));
-          const validTools = [];
+      
+        if (pendingToolMsgs.length && prevAssistantIdx >= 0) {
+          const prevAssistant = messagesOut[prevAssistantIdx];
+          const toolIds = (prevAssistant.tool_calls || []).map(tc => tc.id).filter(Boolean);
+          const idToName = new Map(
+            (prevAssistant.tool_calls || []).map(tc => [tc.id, tc.function?.name || "tool"])
+          );
+      
+          // Séparer valides/invalides + ordonner les valides comme l'assistant
+          const validById = new Map();
           const invalidTools = [];
-
-          // Map tool_call_id -> function.name so we can set "name" on the tool message
-          const idToName = new Map();
-          (prevAssistantWithCalls.tool_calls || []).forEach(tc => {
-            if (tc?.id) idToName.set(tc.id, tc.function?.name || "tool");
-          });
-
           for (const tm of pendingToolMsgs) {
-            if (allIds.has(tm.tool_call_id)) {
-              validTools.push({
-                ...tm,
+            if (toolIds.includes(tm.tool_call_id)) {
+              validById.set(tm.tool_call_id, {
+                role: "tool",
+                tool_call_id: tm.tool_call_id,
                 name: idToName.get(tm.tool_call_id) || "tool",
+                content: tm.content
               });
             } else {
               invalidTools.push(tm);
             }
           }
-
-          // IMPORTANT: émettre les tool **avant** le user pour satisfaire Mistral & co
-          if (validTools.length) {
-            for (const tm of validTools) messagesOut.push(tm);
+          const orderedValidTools = toolIds
+            .filter(id => validById.has(id))
+            .map(id => validById.get(id));
+      
+          // INSÉRER les tools IMMÉDIATEMENT APRES l'assistant (≠ push)
+          if (orderedValidTools.length) {
+            messagesOut.splice(prevAssistantIdx + 1, 0, ...orderedValidTools);
           }
-
-          // Replier les tool invalides dans le texte du user (pas d'envoi de `role:"tool"`)
+      
+          // Replier les invalides dans le texte du user
           if (invalidTools.length) {
             const folded =
               "\n\n[tool_result]\n" +
@@ -411,9 +415,12 @@ function toOpenRouterPayload(b, request, env, mapModel) {
             userText += folded;
           }
         }
-
-        // Enfin pousser le user (après les tools valides)
-        messagesOut.push({ role: "user", content: (userText || "").trim() });
+      
+        // N'émettre le user que s'il reste du texte utile
+        const trimmed = (userText || "").trim();
+        if (trimmed) {
+          messagesOut.push({ role: "user", content: trimmed });
+        }
       }
     }
   }
