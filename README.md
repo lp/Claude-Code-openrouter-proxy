@@ -22,6 +22,9 @@ export ANTHROPIC_BASE_URL="https://proxycodeclaude.mellot-jules.workers.dev"
 
 # 2) API Key: Use your OpenRouter API key in ANTHROPIC_API_KEY
 export ANTHROPIC_API_KEY="sk-or-v1_..."
+
+# 3) For custom model :
+claude --model "z-ai/glm-4.5"
 ```
 
 That's it! Claude Code will now work through the proxy with your OpenRouter key.
