@@ -1,12 +1,33 @@
-name = "proxycodeclaude"
-main = "worker.js"                         # <= ton fichier
+name = "proxycodeclaude"              # <- change si tu veux
+main = "worker.js"                    # <- ton fichier worker
 compatibility_date = "2025-08-15"
-compatibility_flags = ["nodejs_compat"]    # pour fetch, crypto, etc.
+compatibility_flags = ["nodejs_compat"]
 workers_dev = true
 
-[vars]
-REQUIRE_PROXY_TOKEN = "0"
-REASONING_EFFORT = "medium"
+# (optionnel) si tu déploies via CI, renseigne ton account_id :
+# account_id = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 
 [observability]
 enabled = true
+
+[vars]
+# Sécurité
+REQUIRE_PROXY_TOKEN = "0"             # "1" pour exiger PROXY_TOKEN côté client
+# PROXY_TOKEN est un Secret (cf. wrangler secret put PROXY_TOKEN)
+
+# Modèles
+FORCE_MODEL = ""                      # ex: "z-ai/glm-4.5" pour forcer un modèle
+PRIMARY_MODEL = ""                    # ex: "z-ai/glm-4.5"
+FALLBACK_MODEL = ""                   # ex: "anthropic/claude-3.5-haiku"
+MODEL_MAP_EXT = "{}"                  # JSON de remap, ex: {"claude-3-5-haiku-20241022":"anthropic/claude-3.5-haiku"}
+
+# Reasoning
+REASONING_EFFORT = "medium"           # low | medium | high
+
+# Usage & coût
+ESTIMATE_USAGE = "1"                  # fallback si provider ne renvoie pas usage
+ESTIMATE_TOKENS_PER_CHAR = "0.25"     # ~4 chars = 1 token
+PRICING_JSON = "{}"                   # ex: {"z-ai/glm-4.5":{"in":0.0005,"out":0.0015}}
+
+# Réseau / timeouts
+TIMEOUT_MS = "240000"                 # 4 minutes
