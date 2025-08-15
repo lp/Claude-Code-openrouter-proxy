@@ -347,7 +347,7 @@ function toOpenRouterPayload(b, request, env, mapModel) {
         // Bufferiser les tool_result puis décider comment les émettre
         let userText = "";
         const pendingToolMsgs = [];
-      
+
         for (const block of content) {
           if (!block) continue;
           if (block.type === "text") {
@@ -362,13 +362,10 @@ function toOpenRouterPayload(b, request, env, mapModel) {
             userText += JSON.stringify(block) + "\n";
           }
         }
-      
-        // 1) Pousser le user (même vide, si on doit y replier des tool_result)
-        const userIndex = messagesOut.push({ role: "user", content: (userText || "").trim() }) - 1;
-      
-        // 2) Chercher le DERNIER assistant avec tool_calls juste AVANT ce user
+
+        // Chercher le DERNIER assistant avec tool_calls juste AVANT ce user
         let prevAssistantWithCalls = null;
-        for (let i = messagesOut.length - 2; i >= 0; i--) {
+        for (let i = messagesOut.length - 1; i >= 0; i--) {
           const mprev = messagesOut[i];
           if (mprev.role === "assistant" && Array.isArray(mprev.tool_calls) && mprev.tool_calls.length > 0) {
             prevAssistantWithCalls = mprev;
@@ -378,28 +375,45 @@ function toOpenRouterPayload(b, request, env, mapModel) {
             break;
           }
         }
-      
-        if (pendingToolMsgs.length) {
-          const allIds = new Set((prevAssistantWithCalls?.tool_calls || []).map(tc => tc.id).filter(Boolean));
+
+        if (pendingToolMsgs.length && prevAssistantWithCalls) {
+          const allIds = new Set((prevAssistantWithCalls.tool_calls || []).map(tc => tc.id).filter(Boolean));
           const validTools = [];
           const invalidTools = [];
-      
+
+          // Map tool_call_id -> function.name so we can set "name" on the tool message
+          const idToName = new Map();
+          (prevAssistantWithCalls.tool_calls || []).forEach(tc => {
+            if (tc?.id) idToName.set(tc.id, tc.function?.name || "tool");
+          });
+
           for (const tm of pendingToolMsgs) {
-            if (allIds.has(tm.tool_call_id)) validTools.push(tm);
-            else invalidTools.push(tm);
+            if (allIds.has(tm.tool_call_id)) {
+              validTools.push({
+                ...tm,
+                name: idToName.get(tm.tool_call_id) || "tool",
+              });
+            } else {
+              invalidTools.push(tm);
+            }
           }
-      
-          // 3) Émettre UNIQUEMENT les tool avec id correspondant
-          for (const tm of validTools) messagesOut.push(tm);
-      
-          // 4) Replier les tool invalides dans le texte du user (pas d'envoi de `role:"tool"`)
+
+          // IMPORTANT: émettre les tool **avant** le user pour satisfaire Mistral & co
+          if (validTools.length) {
+            for (const tm of validTools) messagesOut.push(tm);
+          }
+
+          // Replier les tool invalides dans le texte du user (pas d'envoi de `role:"tool"`)
           if (invalidTools.length) {
             const folded =
               "\n\n[tool_result]\n" +
               invalidTools.map(t => `id=${t.tool_call_id} content=${t.content}`).join("\n");
-            messagesOut[userIndex].content = (messagesOut[userIndex].content || "") + folded;
+            userText += folded;
           }
         }
+
+        // Enfin pousser le user (après les tools valides)
+        messagesOut.push({ role: "user", content: (userText || "").trim() });
       }
     }
   }
@@ -426,6 +440,24 @@ function toOpenRouterPayload(b, request, env, mapModel) {
 
   const PRIMARY_MODEL  = (env.PRIMARY_MODEL  || "").trim();
   if (PRIMARY_MODEL) out.model = PRIMARY_MODEL;
+
+  // ---- OpenRouter/OpenAI extras passthrough (enable "integrations") ----
+  const passthroughKeys = [
+    // OpenRouter features
+    "plugins",               // e.g. [{ id: "web", max_results: 5, search_prompt: "..." }]
+    "transforms",            // e.g. ["middle-out"]
+    "web_search_options",    // e.g. { search_context_size: "high" }
+    "models",                // routing overrides
+    "provider",              // provider routing preferences
+    "reasoning",             // reasoning tokens config
+    "usage",                 // allow caller override
+    // OpenAI-compatible extras commonly supported by OR
+    "top_p","top_k","frequency_penalty","presence_penalty","repetition_penalty",
+    "seed","logit_bias","response_format","user"
+  ];
+  for (const k of passthroughKeys) {
+    if (b[k] !== undefined) out[k] = b[k];
+  }
 
   return out;
 }
