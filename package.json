@@ -1,0 +1,27 @@
+{
+  "name": "claude-code-openrouter-proxy",
+  "version": "1.0.0",
+  "description": "A proxy server that allows Claude Code to work with OpenRouter API endpoints - Bun runtime",
+  "main": "server.ts",
+  "type": "module",
+  "scripts": {
+    "dev": "bun run --hot server.ts",
+    "start": "bun run server.ts",
+    "fetch-models": "bun run scripts/fetch-anthropic-models.ts"
+  },
+  "keywords": [
+    "claude",
+    "openrouter",
+    "proxy",
+    "bun",
+    "typescript"
+  ],
+  "author": "",
+  "license": "MIT",
+  "engines": {
+    "bun": ">=1.0.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  }
+}

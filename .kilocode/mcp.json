@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "kagi": {
+      "command": "uvx",
+      "args": [
+        "kagimcp"
+      ],
+      "env": {
+        "KAGI_API_KEY": "1uBd6NaIyGeG-3JtEsxD6zS-KhAitZnQ0r_MboJIacA.tIU1dKErJAea3njz0zHF6JUdFUYW7cc4d9yKM3gdr7E",
+        "KAGI_SUMMARIZER_ENGINE": ""
+      }
+    }
+  }
+}
